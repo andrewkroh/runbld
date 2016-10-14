@@ -252,3 +252,6 @@
                   (when (not= newbuf :die)
                     (recur newbuf))))]
      [ch proc])))
+
+(def begin-process! [opts]
+  )
