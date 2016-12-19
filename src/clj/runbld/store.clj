@@ -3,6 +3,7 @@
   (:require [clojure.core.async :as async
              :refer [go go-loop chan >! <! alts! close!]]
             [clojure.spec :as s]
+            [clojure.spec.test :as st]
             runbld.spec
             [clojure.string :as str]
             [elasticsearch.document :as doc]
@@ -18,7 +19,8 @@
 (def MAX_INDEX_BYTES (* 1024 1024 1024))
 
 (s/fdef make-connection
-        :args (s/cat :m ::es-opts))
+        :args (s/cat :m ::es-opts)
+        :ret ::conn)
 (defn make-connection
   [args]
   (http/make args))
@@ -29,38 +31,42 @@
 (defn newest-index-matching-pattern
   [conn pat]
   (try+
-   (->> (indices/get-settings conn {:index pat})
-        (map #(vector
-               (key %)
-               (Long/parseLong
-                (get-in (val %) [:settings :index :creation_date]))))
-        (sort-by second)
-        reverse
-        first
-        first)
+   (let [resp (indices/get-settings conn {:index pat})]
+     (when (not-empty resp)
+       (->> resp
+            (map #(vector
+                   (key %)
+                   (Long/parseLong
+                    (get-in (val %) [:settings :index :creation_date]))))
+            (sort-by second)
+            reverse
+            first
+            first
+            name)))
    (catch [:status 404] _
      ;; index doesn't exist
      )))
 
 (s/fdef index-size-bytes
-        :args (s/cat :c ::conn :idx keyword?))
+        :args (s/cat :c ::conn :idx ::index-name)
+        :ret int?)
 (defn index-size-bytes
   [conn idx]
-  (let [r (conn/request conn :get
-                        {:uri (format "/%s/_stats/store" (name idx))})
+  (let [r (try+
+           (conn/request conn :get
+                         {:uri (format "/%s/_stats/store" (name idx))})
+           (catch [:status 404] _ nil))
         size (get-in r [:indices idx :primaries :store :size_in_bytes])]
-    (when-not size
-      (throw+ {:type ::index-error
-               :msg (format
-                     "could not retrieve metadata for %s, is it red?" idx)}))
-    size))
+    (or size 0)))
 
 (s/fdef create-index
-        :args (s/cat :c ::conn :idx ::index-name :body map?))
+        :args (s/cat :c ::conn :idx ::index-name :body map?)
+        :ret ::index-name)
 (defn create-index
   [conn idx body]
   (try+
-   (indices/create conn idx {:body body})
+   (indices/create conn {:index idx :body body})
+   (indices/wait-for-health conn :yellow {:index idx})
    (catch [:status 400] e
      (when-not (= (get-in e [:body :error :type])
                   "index_already_exists_exception")
@@ -68,10 +74,12 @@
   idx)
 
 (s/fdef create-timestamped-index
-        :args (s/cat :c ::conn :p string? :body map?))
+        :args (s/cat :c ::conn
+                     :p string?
+                     :body ::index-meta))
 (defn create-timestamped-index
   [conn prefix body]
-  (let [idx (format "%s%d" prefix (System/currentTimeMillis))]
+  (let [idx (format "%s-%d" prefix (System/currentTimeMillis))]
     (create-index conn idx body)))
 
 (s/fdef set-up-index
@@ -82,7 +90,8 @@
                :a2 (s/cat :c ::conn
                           :i ::index-name
                           :b map?
-                          :bytes ::max-index-bytes)))
+                          :bytes ::max-index-bytes))
+        :ret keyword?)
 (defn set-up-index
   ([conn idx body]
    (set-up-index conn idx body MAX_INDEX_BYTES))
@@ -91,10 +100,11 @@
                  conn (format "%s*" idx))]
      (if (and newest (<= (index-size-bytes conn newest) max-bytes))
        (name newest)
-       (create-timestamped-index conn (format "%s-" idx) body)))))
+       (create-timestamped-index conn idx body)))))
 
 (s/fdef set-up-es!
-        :args (s/cat :o ::opts))
+          :args (s/cat :o ::opts)
+          :ret int?)
 (defn set-up-es! [{:keys [url
                           build-index
                           failure-index
@@ -295,9 +305,9 @@
                     (recur newbuf))))]
      [ch proc])))
 
-(defn begin-process! [opts]
-  )
+#_(defn begin-process! [opts]
+    )
 
-(s/fdef begin-process!
-        :args (s/cat :opts :runbld.opts/full)
-        :ret keyword?)
+#_(s/fdef begin-process!
+          :args (s/cat :opts :runbld.opts/full)
+          :ret keyword?)
